@@ -3,11 +3,11 @@
  * @brief FreeRTOS Dual-Core Universal IR Remote & Weather Station
  * 
  * Hardware Layout:
- * - Core 1: User Interactions, IR Transmission/Learning, Network Connection, Weather Fetching
- * - Core 0: DHT20 Sensor Sampling, Double-Buffered LCD Rendering, I2C Bus Management
+ * - Core 1: User Interactions, Buttons, IR Tx/Rx, DHT20 Sensor Sampling, Double-Buffered LCD (I2C)
+ * - Core 0: WiFi Connection Maintenance, Weather API Fetching, Network Stack (lwIP)
  * 
  * Dependencies:
- * - LiquidCrystal_I2C, DHT20, IRremote, ArduinoJson, ThingsBoard, WiFi, Preferences
+ * - LiquidCrystal_I2C, DHT20, IRremote, ArduinoJson, WiFi, Preferences, HTTPClient
  */
 
 #include <Arduino.h>
@@ -17,9 +17,6 @@
 #include <DHT20.h>
 #include <IRremote.hpp>
 #include <Preferences.h>
-#include <Arduino_MQTT_Client.h>
-#include <ThingsBoard.h>
-#include <Server_Side_RPC.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
@@ -37,30 +34,17 @@ const int LEARN_BTN_2_PIN = 17;
 const int SEND_BTN_PIN    = 15;     
 
 // ============================================================================
-// 2. NETWORK & THINGSBOARD CONFIGURATION
+// 2. NETWORK & WEATHER CONFIGURATION
 // ============================================================================
 constexpr char WIFI_SSID[]           = "NHA 138";
 constexpr char WIFI_PASSWORD[]       = "138nguyentrai";
-constexpr char TOKEN[]               = "7fd15ugptp5cs2yil8ad";
-constexpr char THINGSBOARD_SERVER[]   = "app.coreiot.io";
-constexpr uint16_t THINGSBOARD_PORT  = 1883U;
-
-constexpr uint32_t MAX_MESSAGE_SIZE      = 1024U;
+constexpr char WEATHER_API_KEY[]     = "504ca910c5a942dab9b231229262505"; // Set your WeatherAPI.com API Key here
 constexpr uint32_t SERIAL_DEBUG_BAUD     = 115200U;
 constexpr int16_t telemetrySendInterval  = 10000U;
-
-WiFiClient wifiClient;
-Arduino_MQTT_Client tbAdapter(wifiClient);
-
-// Server-Side RPC initialization (ThingsBoard v0.14+ Architecture)
-Server_Side_RPC<2U> rpc;
-const std::array<IAPI_Implementation*, 1> apis = { &rpc };
-ThingsBoard tb(tbAdapter, MAX_MESSAGE_SIZE, MAX_MESSAGE_SIZE, Default_Max_Stack_Size, apis);
 
 // ============================================================================
 // 3. SYNCHRONIZATION & QUEUE DEFINITIONS
 // ============================================================================
-SemaphoreHandle_t tbMutex;
 SemaphoreHandle_t i2cMutex;
 
 enum Command {
@@ -101,41 +85,6 @@ void task_sensor(void *pvParameters);
 void task_lcd(void *pvParameters);
 void task_network(void *pvParameters);
 void task_weather(void *pvParameters);
-
-// ============================================================================
-// 5. THINGSBOARD RPC CALLBACKS
-// ============================================================================
-
-/**
- * @brief RPC Callback for Device Switch (Fires IR Toggle)
- */
-void switchDevice(const JsonVariantConst &data, JsonDocument &response) {
-    Serial.println("\n[Network] Dashboard Button Clicked! Firing IR...");
-    Command cmd = CMD_SEND_TOGGLE;
-    xQueueSend(commandQueue, &cmd, 0);
-    response["toggleDevice"] = "Success";
-}
-
-/**
- * @brief RPC Callback for LCD Backlight Toggle
- */
-void setLcdBacklight(const JsonVariantConst &data, JsonDocument &response) {
-  Serial.println("\n[Network] LCD Backlight Switch Toggled!");
-  bool newState = data.as<bool>();
-  isLcdBacklightOn = newState;
-  
-  if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
-    if (newState) lcd.backlight();
-    else lcd.noBacklight();
-    xSemaphoreGive(i2cMutex);
-  }
-  response["setLcdBacklightValue"] = newState;
-}
-
-const std::array<RPC_Callback, 2U> callbacks = {
-  RPC_Callback{ "toggleDevice", switchDevice },
-  RPC_Callback{ "setLcdBacklightValue", setLcdBacklight }
-};
 
 // ============================================================================
 // 6. NETWORKING HELPER FUNCTIONS
@@ -194,22 +143,19 @@ void setup() {
   // Initialize FreeRTOS Queues and Mutexes
   commandQueue = xQueueCreate(5, sizeof(Command));
   sensorQueue  = xQueueCreate(1, sizeof(SensorData)); 
-  tbMutex      = xSemaphoreCreateMutex();
   i2cMutex     = xSemaphoreCreateMutex();
 
-  if (commandQueue == NULL || sensorQueue == NULL || i2cMutex == NULL || tbMutex == NULL) {
+  if (commandQueue == NULL || sensorQueue == NULL || i2cMutex == NULL) {
     Serial.println("[System Error] Failed creating RTOS Queues or Mutex!");
     return;
   }
 
-  // Set explicit TCP/IP timeout (3 seconds) to prevent Watchdog resets during network delays
-  wifiClient.setTimeout(3000);
   InitWiFi();
 
   Serial.println("[System] Booting RTOS Tasks...");
 
   // ==========================================================================
-  // CORE 1 (APP CPU): User Interactions, Precise Timing, & Blocking Network
+  // CORE 1 (APP CPU): User Interactions, Precise Timing, & I2C Peripherals
   // ==========================================================================
   xTaskCreatePinnedToCore(task_button, "task_button", 2048, NULL, 3, NULL, 1); 
   vTaskDelay(pdMS_TO_TICKS(50));
@@ -217,19 +163,20 @@ void setup() {
   xTaskCreatePinnedToCore(task_IRcontrol, "task_IRcontrol", 4096, NULL, 3, NULL, 1); 
   vTaskDelay(pdMS_TO_TICKS(50));
   
-  xTaskCreatePinnedToCore(task_network, "Network", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(task_sensor, "Sensors", 2048, NULL, 1, NULL, 1);
   vTaskDelay(pdMS_TO_TICKS(50));
   
-  xTaskCreatePinnedToCore(task_weather, "WeatherAPI", 6144, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(task_lcd, "LCD", 3072, NULL, 1, NULL, 1);
   vTaskDelay(pdMS_TO_TICKS(50));
 
   // ==========================================================================
-  // CORE 0 (PRO CPU): Background DHT sampling & Buffered I2C LCD Updates
+  // CORE 0 (PRO CPU): Background Network Connection & Weather Fetching
   // ==========================================================================
-  xTaskCreatePinnedToCore(task_sensor, "Sensors", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(task_network, "Network", 4096, NULL, 1, NULL, 0);
   vTaskDelay(pdMS_TO_TICKS(50));
   
-  xTaskCreatePinnedToCore(task_lcd, "LCD", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(task_weather, "WeatherAPI", 6144, NULL, 1, NULL, 0);
+  vTaskDelay(pdMS_TO_TICKS(50));
   
   Serial.println("[System] FreeRTOS Universal Remote + IoT Ready!");
 }
@@ -412,47 +359,17 @@ void task_network(void *pvParameters) {
       InitWiFi();
     }
     
-    // Manage ThingsBoard MQTT connection cycle when WiFi is active
-    if (WiFi.status() == WL_CONNECTED) {
-        if (xSemaphoreTake(tbMutex, portMAX_DELAY) == pdTRUE) {
-            if (!tb.connected()) {
-                Serial.print("[ThingsBoard] Connecting...");
-                
-                if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
-                    Serial.println(" Failed.");
-                    xSemaphoreGive(tbMutex); 
-                    // Sleep to prevent tight CPU hammering during broker outages
-                    vTaskDelay(pdMS_TO_TICKS(5000)); 
-                    continue; 
-                } else {
-                    Serial.println(" Success!");
-                    tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
-                    
-                    if (!rpc.RPC_Subscribe(callbacks.cbegin(), callbacks.cend())) {
-                        Serial.println("[ThingsBoard] Failed to subscribe for RPC");
-                    } else {
-                        Serial.println("[ThingsBoard] RPC Subscribe done");
-                    }
-                }
-            }
-
-            if (tb.connected()) {
-                tb.loop();
-            }
-
-            xSemaphoreGive(tbMutex); 
-        }
-    }
     
     vTaskDelay(pdMS_TO_TICKS(50)); // Yield to allow other tasks to breathe
   }
 }
 
 /**
- * @brief Task: Fetches weather data periodically from Open-Meteo REST API
+ * @brief Task: Fetches weather data periodically from WeatherAPI.com REST API
  */
 void task_weather(void *pvParameters) {
-  const char* weatherUrl = "https://api.open-meteo.com/v1/forecast?latitude=10.759197&longitude=106.678694&current_weather=true";
+  char weatherUrl[150];
+  snprintf(weatherUrl, sizeof(weatherUrl), "http://api.weatherapi.com/v1/current.json?key=%s&q=10.759197,106.678694", WEATHER_API_KEY);
 
   // Pause initially to allow network configuration to fully complete
   vTaskDelay(pdMS_TO_TICKS(10000)); 
@@ -470,7 +387,7 @@ void task_weather(void *pvParameters) {
         DeserializationError error = deserializeJson(doc, payload);
 
         if (!error) {
-          outsideTemp    = doc["current_weather"]["temperature"];
+          outsideTemp    = doc["current"]["temp_c"];
           hasOutsideTemp = true;
           Serial.printf("[Weather] Outside Temp updated: %.1f C\n", outsideTemp);
         } else {
@@ -513,17 +430,6 @@ void task_sensor(void *pvParameters) {
        // Push current values to LCD renderer queue
        xQueueOverwrite(sensorQueue, &data);
 
-       // Upload telemetry data safely to ThingsBoard
-       if (xSemaphoreTake(tbMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-           if (tb.connected()) {
-              tb.sendTelemetryData("temperature", data.temperature);
-              tb.sendTelemetryData("humidity", data.humidity);
-              
-              tb.sendAttributeData("rssi", WiFi.RSSI());
-              tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
-           }
-           xSemaphoreGive(tbMutex); 
-       }
     }
 
     vTaskDelay(pdMS_TO_TICKS(telemetrySendInterval));
@@ -621,7 +527,7 @@ void task_lcd(void *pvParameters) {
     }
 
     // Wait for fresh sensor packets
-    if (xQueueReceive(sensorQueue, &receivedData, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    if (xQueueReceive(sensorQueue, &receivedData, pdMS_TO_TICKS(100)) == pdTRUE) {
       hasValidData = true;
     }
 
